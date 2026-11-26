@@ -4,7 +4,6 @@ import re
 import csv
 import io
 import threading
-from difflib import SequenceMatcher
 
 st.set_page_config(
     page_title="Group Dictation Challenge",
@@ -13,8 +12,11 @@ st.set_page_config(
 )
 
 # =====================================
-# 1. 기본 지문
+# 1. 기본 설정
 # =====================================
+
+TEACHER_PASSWORD = "1201"
+GROUP_COUNT = 7
 
 DEFAULT_PASSAGE = """On New Year’s Eve, Emily was cleaning her room when she discovered an old notebook under her desk. Inside, she found a list of New Year’s resolutions she had written a year earlier: exercise every morning, read thirty books, and improve her English.
 
@@ -30,15 +32,14 @@ As the clock struck midnight, Emily opened her notebook and wrote one final sent
 
 
 # =====================================
-# 2. 여러 접속자가 공유하는 메모리
+# 2. 공유 데이터
 # =====================================
 
 @st.cache_resource
 def get_shared_data():
     return {
         "passage": DEFAULT_PASSAGE,
-        "group_count": 4,
-        "answers": {},
+        "answers": {f"Group {i}": "" for i in range(1, 8)},
         "finished": False,
         "revealed": False,
         "lock": threading.RLock()
@@ -48,95 +49,117 @@ data = get_shared_data()
 
 
 # =====================================
-# 3. 채점 함수
+# 3. 단어 정규화
 # =====================================
 
 def normalize_word(word):
-    word = word.replace("’", "'")
+    word = word.replace("’", "'").replace("‘", "'")
     return re.sub(r"[^\w'-]", "", word).casefold()
 
+
+# =====================================
+# 4. 편집 거리 기반 채점
+# =====================================
 
 def calculate_score(original, answer):
 
     original_words = original.split()
     answer_words = answer.split()
 
-    original_norm = [normalize_word(w) for w in original_words]
-    answer_norm = [normalize_word(w) for w in answer_words]
+    a = [normalize_word(w) for w in original_words]
+    b = [normalize_word(w) for w in answer_words]
 
-    matcher = SequenceMatcher(
-        None,
-        original_norm,
-        answer_norm,
-        autojunk=False
+    n = len(a)
+    m = len(b)
+
+    # 편집 거리 행렬
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+
+    for i in range(n + 1):
+        dp[i][0] = i
+
+    for j in range(m + 1):
+        dp[0][j] = j
+
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+
+            dp[i][j] = min(
+                dp[i - 1][j] + 1,       # 단어 누락
+                dp[i][j - 1] + 1,       # 단어 추가
+                dp[i - 1][j - 1] + cost # 단어 교체
+            )
+
+    # 최적 정렬 역추적
+    details = []
+    i, j = n, m
+    correct = 0
+    errors = 0
+
+    while i > 0 or j > 0:
+
+        if (
+            i > 0 and j > 0
+            and a[i - 1] == b[j - 1]
+            and dp[i][j] == dp[i - 1][j - 1]
+        ):
+            details.append({
+                "status": "correct",
+                "original": original_words[i - 1],
+                "answer": answer_words[j - 1]
+            })
+            correct += 1
+            i -= 1
+            j -= 1
+
+        elif (
+            i > 0 and j > 0
+            and dp[i][j] == dp[i - 1][j - 1] + 1
+        ):
+            details.append({
+                "status": "incorrect",
+                "original": original_words[i - 1],
+                "answer": answer_words[j - 1]
+            })
+            errors += 1
+            i -= 1
+            j -= 1
+
+        elif i > 0 and dp[i][j] == dp[i - 1][j] + 1:
+            details.append({
+                "status": "missing",
+                "original": original_words[i - 1],
+                "answer": "(누락)"
+            })
+            errors += 1
+            i -= 1
+
+        else:
+            details.append({
+                "status": "extra",
+                "original": "(없음)",
+                "answer": answer_words[j - 1]
+            })
+            errors += 1
+            j -= 1
+
+    details.reverse()
+
+    # 전체 정답 단어와 학생 입력 단어 중 긴 쪽을 기준으로 정확성 계산
+    denominator = max(n, m, 1)
+
+    accuracy = round(
+        max(0, 100 * (1 - errors / denominator)),
+        1
     )
 
-    correct = 0
-    details = []
-
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-
-        if tag == "equal":
-            for i, j in zip(range(i1, i2), range(j1, j2)):
-                correct += 1
-                details.append({
-                    "status": "correct",
-                    "original": original_words[i],
-                    "answer": answer_words[j]
-                })
-
-        elif tag == "replace":
-
-            original_part = original_words[i1:i2]
-            answer_part = answer_words[j1:j2]
-
-            paired = min(len(original_part), len(answer_part))
-
-            for i in range(paired):
-                details.append({
-                    "status": "incorrect",
-                    "original": original_part[i],
-                    "answer": answer_part[i]
-                })
-
-            for word in original_part[paired:]:
-                details.append({
-                    "status": "missing",
-                    "original": word,
-                    "answer": "(누락)"
-                })
-
-            for word in answer_part[paired:]:
-                details.append({
-                    "status": "extra",
-                    "original": "(없음)",
-                    "answer": word
-                })
-
-        elif tag == "delete":
-            for word in original_words[i1:i2]:
-                details.append({
-                    "status": "missing",
-                    "original": word,
-                    "answer": "(누락)"
-                })
-
-        elif tag == "insert":
-            for word in answer_words[j1:j2]:
-                details.append({
-                    "status": "extra",
-                    "original": "(없음)",
-                    "answer": word
-                })
-
-    total = len(original_words)
-    score = round(correct / max(total, 1) * 100, 1)
-
-    return correct, total, score, details
+    return correct, denominator, accuracy, details, errors
 
 
 # =====================================
-# 4. 화면 선택
+# 5. 화면 선택
 # =====================================
 
 st.title("📝 Group Dictation Challenge")
@@ -152,7 +175,7 @@ st.divider()
 
 
 # =====================================
-# 5. 학생용 화면
+# 6. 학생용
 # =====================================
 
 if mode == "학생용":
@@ -162,38 +185,88 @@ if mode == "학생용":
     with data["lock"]:
         finished = data["finished"]
         revealed = data["revealed"]
-        group_count = data["group_count"]
 
+    # 활동 종료 후 결과 공개
     if finished:
 
         st.warning("받아쓰기 활동이 종료되었습니다.")
 
         if revealed:
-            st.success("결과가 공개되었습니다!")
+
+            st.success("🏆 결과가 공개되었습니다!")
+
+            with data["lock"]:
+                passage = data["passage"]
+                answers = dict(data["answers"])
+
+            results = []
+
+            for i in range(1, 8):
+
+                group = f"Group {i}"
+                answer = answers.get(group, "")
+
+                correct, total, accuracy, details, errors = (
+                    calculate_score(passage, answer)
+                )
+
+                results.append({
+                    "group": group,
+                    "accuracy": accuracy,
+                    "correct": correct,
+                    "total": total
+                })
+
+            results.sort(
+                key=lambda x: x["accuracy"],
+                reverse=True
+            )
+
+            for rank, result in enumerate(results, 1):
+
+                st.subheader(
+                    f"{rank}위 | {result['group']}"
+                )
+
+                st.metric(
+                    "정확성",
+                    f"{result['accuracy']}%"
+                )
+
+                st.progress(result["accuracy"] / 100)
 
         st.stop()
 
-    st.write("모둠을 선택하고 받아쓰기한 내용을 입력하세요.")
-
-    group_names = [
-        f"Group {i}" for i in range(1, group_count + 1)
-    ]
+    # 모둠 선택
+    group_names = [f"Group {i}" for i in range(1, 8)]
 
     selected_group = st.selectbox(
-        "우리 모둠",
-        group_names
+        "우리 모둠을 선택하세요.",
+        group_names,
+        key="selected_group"
     )
 
+    st.info(
+        "모둠을 선택한 뒤 받아쓰기 내용을 입력하세요. "
+        "제출 후에도 활동 종료 전까지 수정할 수 있습니다."
+    )
+
+    # 모둠별 독립 입력창
     with data["lock"]:
         saved_answer = data["answers"].get(selected_group, "")
+
+    widget_key = f"answer_{selected_group}"
+
+    if widget_key not in st.session_state:
+        st.session_state[widget_key] = saved_answer
 
     with st.form(f"form_{selected_group}"):
 
         answer = st.text_area(
-            "받아쓰기 답안",
-            value=saved_answer,
+            "Dictation Answer",
             height=300,
-            placeholder="Write your dictation here..."
+            placeholder="Write your answer here...",
+            key=widget_key
         )
 
         submitted = st.form_submit_button(
@@ -207,7 +280,7 @@ if mode == "학생용":
         with data["lock"]:
 
             if data["finished"]:
-                st.error("이미 활동이 종료되었습니다.")
+                st.error("활동이 종료되었습니다.")
 
             else:
                 data["answers"][selected_group] = answer
@@ -218,22 +291,22 @@ if mode == "학생용":
     with data["lock"]:
         current_answer = data["answers"].get(selected_group, "")
 
-    if current_answer:
-        st.info("현재 제출된 답안이 있습니다. 다시 제출하면 수정됩니다.")
+    if current_answer.strip():
+        st.success("현재 제출된 답안이 있습니다.")
     else:
         st.caption("아직 제출된 답안이 없습니다.")
 
 
 # =====================================
-# 6. 교사용 화면
+# 7. 교사용
 # =====================================
 
 elif mode == "교사용":
 
-    # 교사 비밀번호 확인
+    # 로그인
     if not st.session_state.get("teacher_authenticated", False):
 
-        st.subheader("🔐 Teacher Login")
+        st.header("🔐 Teacher Login")
 
         password = st.text_input(
             "교사 비밀번호",
@@ -242,14 +315,10 @@ elif mode == "교사용":
 
         if st.button("로그인", type="primary"):
 
-            correct_password = st.secrets.get(
-                "TEACHER_PASSWORD",
-                "change-this-password"
-            )
-
-            if password == correct_password:
+            if password == TEACHER_PASSWORD:
                 st.session_state.teacher_authenticated = True
                 st.rerun()
+
             else:
                 st.error("비밀번호가 틀렸습니다.")
 
@@ -257,48 +326,38 @@ elif mode == "교사용":
 
     st.header("👩‍🏫 Teacher Dashboard")
 
-    # ---------------------------------
-    # 활동 설정
-    # ---------------------------------
-
     with data["lock"]:
         finished = data["finished"]
         revealed = data["revealed"]
-        current_passage = data["passage"]
-        current_count = data["group_count"]
+        passage = data["passage"]
+        answers = dict(data["answers"])
 
-    st.subheader("1. Activity Settings")
+    # ---------------------------------
+    # 지문 설정
+    # ---------------------------------
 
-    with st.form("settings_form"):
+    st.subheader("1. 정답 원문 설정")
+
+    with st.form("passage_form"):
 
         new_passage = st.text_area(
-            "정답 원문 (학생 화면에는 표시되지 않음)",
-            value=current_passage,
+            "정답 원문 (학생에게 공개되지 않습니다.)",
+            value=passage,
             height=250,
             disabled=finished
         )
 
-        new_count = st.number_input(
-            "모둠 수",
-            min_value=1,
-            max_value=20,
-            value=current_count,
-            step=1,
+        save_passage = st.form_submit_button(
+            "원문 저장",
             disabled=finished
         )
 
-        save_settings = st.form_submit_button(
-            "설정 저장",
-            disabled=finished
-        )
-
-    if save_settings:
+    if save_passage:
 
         with data["lock"]:
             data["passage"] = new_passage
-            data["group_count"] = int(new_count)
 
-        st.success("설정이 저장되었습니다.")
+        st.success("원문이 저장되었습니다.")
         st.rerun()
 
     st.divider()
@@ -307,37 +366,30 @@ elif mode == "교사용":
     # 제출 현황
     # ---------------------------------
 
-    st.subheader("2. Submission Status")
+    st.subheader("2. 모둠별 제출 현황")
 
     if st.button("🔄 제출 현황 새로고침"):
-
         st.rerun()
-
-    with data["lock"]:
-
-        answers_snapshot = dict(data["answers"])
-        group_count = data["group_count"]
 
     submitted_count = 0
 
-    for i in range(1, group_count + 1):
+    with data["lock"]:
+        answers = dict(data["answers"])
+
+    for i in range(1, 8):
 
         group = f"Group {i}"
-        answer = answers_snapshot.get(group, "")
+        answer = answers.get(group, "")
 
         if answer.strip():
             submitted_count += 1
-            status = "✅ 제출 완료"
+            st.write(f"**{group}** — ✅ 제출 완료")
         else:
-            status = "⏳ 대기 중"
+            st.write(f"**{group}** — ⏳ 대기 중")
 
-        st.write(f"**{group}** — {status}")
+    st.write(f"제출 현황: {submitted_count} / 7")
 
-    st.write(
-        f"제출 현황: {submitted_count} / {group_count}개 모둠"
-    )
-
-    st.progress(submitted_count / max(group_count, 1))
+    st.progress(submitted_count / 7)
 
     st.divider()
 
@@ -345,7 +397,7 @@ elif mode == "교사용":
     # 활동 제어
     # ---------------------------------
 
-    st.subheader("3. Activity Control")
+    st.subheader("3. 활동 제어")
 
     if not finished:
 
@@ -380,43 +432,41 @@ elif mode == "교사용":
         else:
             st.success("결과가 공개되었습니다.")
 
-    st.divider()
-
     # ---------------------------------
-    # 결과 확인
+    # 결과
     # ---------------------------------
 
     if revealed:
 
+        st.divider()
         st.subheader("4. Final Results")
 
         with data["lock"]:
             passage = data["passage"]
-            answers_snapshot = dict(data["answers"])
-            group_count = data["group_count"]
+            answers = dict(data["answers"])
 
         results = []
 
-        for i in range(1, group_count + 1):
+        for i in range(1, 8):
 
             group = f"Group {i}"
-            answer = answers_snapshot.get(group, "")
+            answer = answers.get(group, "")
 
-            correct, total, score, details = calculate_score(
-                passage,
-                answer
+            correct, total, accuracy, details, errors = (
+                calculate_score(passage, answer)
             )
 
             results.append({
                 "group": group,
                 "correct": correct,
                 "total": total,
-                "score": score,
+                "accuracy": accuracy,
+                "errors": errors,
                 "details": details
             })
 
         results.sort(
-            key=lambda x: x["score"],
+            key=lambda x: x["accuracy"],
             reverse=True
         )
 
@@ -429,12 +479,16 @@ elif mode == "교사용":
             )
 
             st.metric(
-                "정답 단어",
-                f"{result['correct']} / {result['total']}",
-                f"{result['score']}%"
+                "정확성",
+                f"{result['accuracy']}%"
             )
 
-            st.progress(result["score"] / 100)
+            st.caption(
+                f"정답 단어 {result['correct']}개 · "
+                f"오류 {result['errors']}개"
+            )
+
+            st.progress(result["accuracy"] / 100)
 
         st.divider()
 
@@ -475,15 +529,18 @@ elif mode == "교사용":
             "Group",
             "Correct Words",
             "Total Words",
-            "Score"
+            "Accuracy",
+            "Errors"
         ])
 
         for result in results:
+
             writer.writerow([
                 result["group"],
                 result["correct"],
                 result["total"],
-                result["score"]
+                result["accuracy"],
+                result["errors"]
             ])
 
         st.download_button(
@@ -493,16 +550,16 @@ elif mode == "교사용":
             mime="text/csv"
         )
 
-    st.divider()
-
     # ---------------------------------
     # 새 활동 초기화
     # ---------------------------------
 
-    with st.expander("새 활동 준비"):
+    st.divider()
+
+    with st.expander("새 활동 시작"):
 
         st.warning(
-            "초기화하면 모든 모둠의 제출 답안과 활동 상태가 사라집니다."
+            "초기화하면 모든 모둠의 답안과 활동 상태가 삭제됩니다."
         )
 
         confirm_reset = st.checkbox(
@@ -516,11 +573,14 @@ elif mode == "교사용":
 
             with data["lock"]:
 
-                data["answers"] = {}
+                data["answers"] = {
+                    f"Group {i}": "" for i in range(1, 8)
+                }
+
                 data["finished"] = False
                 data["revealed"] = False
 
-            st.success("새 활동을 시작할 수 있습니다.")
+            st.success("초기화 완료!")
             st.rerun()
 
 
